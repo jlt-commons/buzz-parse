@@ -83,12 +83,12 @@ jobs:
         with:
           msystem: UCRT64
           path-type: inherit
+          # lz4: jolt build links it statically once a static native is in play
           install: >-
             curl unzip zip perl
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-ntldd
             mingw-w64-ucrt-x86_64-zlib
-            # jolt build links lz4 statically once a static native is in play
             mingw-w64-ucrt-x86_64-lz4
 
       - name: Install jolt's libraries
