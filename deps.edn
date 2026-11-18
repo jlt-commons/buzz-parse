@@ -1,0 +1,75 @@
+{:paths ["src"]
+
+ ;; buzz-parse is a jolt HTML parser over lexbor (https://github.com/lexbor/lexbor)
+ ;; with crouton's API: parse / parse-string return clojure.xml-style trees,
+ ;; plus CSS selectors and fragment parsing from lexbor.
+ ;;
+ ;; lexbor's single.pl amalgamates the html, css and selectors modules into one
+ ;; header, which native/buzz_shim.c includes and wraps in a flat bp_* API.
+ ;; LEXBOR_HOME names a lexbor checkout; without it the `native` task clones
+ ;; the pinned commit into vendor/lexbor. 0.8.26 is the first jolt that runs
+ ;; :build when the dylib is missing, so a git dep builds itself.
+ :jolt/min-version "0.8.26"
+
+ :deps {}
+
+ :jolt/native [{:name "buzz_parse"
+                :darwin ["native/libbuzz_parse.dylib"]
+                :linux  ["native/libbuzz_parse.so"]
+                :windows ["native/buzz_parse.dll"]
+                :build  "native"
+                :static {:archive "native/libbuzz_parse.a"}}]
+
+ :aliases {:test {:extra-paths ["test"]
+                  :main-opts   ["-m" "buzz-parse.test-runner"]}}
+
+ :tasks {:requires ([babashka.fs :as fs])
+         :init (do
+                 ;; the lexbor commit buzz-parse is developed and tested against
+                 (def lexbor-ref "e609d9446f7adf06c67b89dcdc4a7c39430f0bd8")
+                 (def os (let [n (System/getProperty "os.name")]
+                           (cond (re-find #"^Mac" n) :darwin
+                                 (re-find #"^Windows" n) :windows
+                                 :else :linux)))
+                 (def lib ({:darwin "native/libbuzz_parse.dylib"
+                            :linux "native/libbuzz_parse.so"
+                            :windows "native/buzz_parse.dll"} os))
+                 (def archive "native/libbuzz_parse.a")
+                 ;; MSYS2's UCRT64 toolchain names its compiler gcc
+                 (def cc (if (= os :windows) "gcc" "cc")))
+
+         native {:doc "build the lexbor shim (shared + static) if its sources changed"
+                 :task (let [home   (or (System/getenv "LEXBOR_HOME") "vendor/lexbor")
+                             single "native/build/lexbor_single.h"
+                             obj    "native/build/buzz_shim.o"]
+                         (when-not (fs/exists? (str home "/single.pl"))
+                           (if (System/getenv "LEXBOR_HOME")
+                             (throw (ex-info (str "LEXBOR_HOME has no single.pl: " home) {:home home}))
+                             (do (fs/create-dirs "vendor")
+                                 (shell "git" "clone" "--quiet" "https://github.com/lexbor/lexbor" home)
+                                 (shell {:dir home} "git" "checkout" "--quiet" lexbor-ref))))
+                         (if (or (not (fs/exists? lib))
+                                 (not (fs/exists? archive))
+                                 (seq (fs/modified-since lib ["native/buzz_shim.c" "native/buzz_shim.h" "deps.edn"
+                                                              (str home "/version")])))
+                           (do (fs/create-dirs "native/build")
+                               (spit single (:out (shell {:out :string}
+                                                         "perl" (str home "/single.pl")
+                                                         (str "--port=" (if (= os :windows) "windows_nt" "posix"))
+                                                         "html" "css" "selectors")))
+                               ;; the amalgamation defines LEXBOR_STATIC; with hidden visibility
+                               ;; (dllexport on Windows) only the bp_* API is exported
+                               (shell cc "-O2" "-fPIC" "-c" "-fvisibility=hidden"
+                                      "-Inative/build" "-Inative"
+                                      "native/buzz_shim.c" "-o" obj)
+                               (shell cc "-shared" obj "-o" lib)
+                               (fs/delete-if-exists archive)
+                               (shell "ar" "rcs" archive obj)
+                               (println "built:" lib archive))
+                           (println "up to date:" lib)))}
+
+         test {:doc "unit tests" :depends [native] :task (shell "jolt -M:test")}
+         dist {:doc "build the standalone buzz-parse binary"
+               :depends [native]
+               :task (shell "jolt" "build" "-m" "buzz-parse.cli" "-o" "target/buzz-parse")}
+         clean {:doc "remove build output" :task (fs/delete-tree "native/build")}}}

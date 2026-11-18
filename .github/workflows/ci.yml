@@ -1,0 +1,219 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    # pushing a version tag releases it, once the tests pass
+    tags: ['v*']
+  pull_request:
+  # "Run workflow" on main: tag the commit and release it, once the tests pass
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, like v0.2.0'
+        required: true
+        type: string
+
+# pinned: a new release would change what CI runs on
+env:
+  JOLT_VERSION: v0.8.27
+
+permissions:
+  contents: read
+
+jobs:
+  # the shim is C, so test it on both unix ABIs
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux
+          - os: macos-latest
+            target: aarch64-macos
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jolt's libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblz4-1 zlib1g libtinfo6
+      - name: Install jolt
+        run: ci/install-jolt.sh "$JOLT_VERSION" "${{ matrix.target }}"
+      # the native task clones the lexbor commit pinned in deps.edn into vendor/
+      - name: Build the lexbor shim and test
+        run: jolt run test
+
+  # a standalone binary per platform, built and smoke-tested on every run so a
+  # broken build shows up before a release, not in one
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-macos
+            shell: bash
+          # 22.04's glibc, so the binary runs there and on anything newer
+          - os: ubuntu-22.04
+            target: x86_64-linux
+            shell: bash
+          # the archive carries the MSYS2 DLLs the binary links
+          - os: windows-latest
+            target: x86_64-windows
+            shell: msys2 {0}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      # the input for a manual run, the tag's name for a tag push
+      VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          path-type: inherit
+          install: >-
+            curl unzip zip perl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-ntldd
+            mingw-w64-ucrt-x86_64-zlib
+
+      - name: Install jolt's libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblz4-1 zlib1g libtinfo6
+
+      - name: Install jolt
+        run: ci/install-jolt.sh "$JOLT_VERSION" "${{ matrix.target }}"
+
+      # links native/libbuzz_parse.a statically
+      - name: Build binary
+        run: jolt run dist
+
+      # a release's archive carries its version; any other run's gets the bare name
+      - name: Package
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            name="buzz-parse-${VERSION}-${{ matrix.target }}"
+          else
+            name="buzz-parse-${{ matrix.target }}"
+          fi
+          mkdir -p "$name"
+          exe=buzz-parse
+          [ -f target/buzz-parse.exe ] && exe=buzz-parse.exe
+          cp "target/$exe" README.md LICENSE "$name/"
+          # Windows looks beside the exe first for the DLLs it loads
+          if [ "$RUNNER_OS" = Windows ]; then
+            deps=$(ntldd -R "target/$exe" | grep -ioE '[^ ]*ucrt64[\\/]bin[\\/][^ ]*\.dll' || true)
+            for d in $deps; do cp "$(cygpath -u "$d")" "$name/"; done
+          fi
+          # what the binary links, for the release notes and for debugging
+          case "$RUNNER_OS" in
+            Linux) ldd "$name/$exe" ;;
+            macOS) otool -L "$name/$exe" ;;
+            Windows) ls "$name" ;;
+          esac
+          echo "PKG_DIR=$name" >> "$GITHUB_ENV"
+          echo "PKG_EXE=$exe" >> "$GITHUB_ENV"
+
+      # Run the packaged binary with the shim's shared library and build
+      # output hidden, so it can't lean on files only the build machine has.
+      # On Windows MSYS2 leaves the PATH too, so the archive has to carry
+      # every DLL it loads.
+      - name: Smoke test
+        run: |
+          mv native native.hidden
+          if [ "$RUNNER_OS" = Windows ]; then
+            PATH=$(printf %s "$PATH" | tr : '\n' | grep -vi ucrt64 | paste -sd:)
+          fi
+          status=0
+          ci/smoke.sh "./$PKG_DIR/$PKG_EXE" || status=$?
+          mv native.hidden native
+          exit $status
+
+      - name: Archive
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            zip -qr "${PKG_DIR}.zip" "$PKG_DIR"
+            echo "PKG=${PKG_DIR}.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "${PKG_DIR}.tar.gz" "$PKG_DIR"
+            echo "PKG=${PKG_DIR}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ env.PKG }}
+          if-no-files-found: error
+
+  release:
+    needs: [test, build]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # the input for a manual run, the tag's name for a tag push
+      VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check the version and where it points
+        run: |
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must look like v1.2.3, got '$VERSION'"
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            if [ "$GITHUB_REF" != refs/heads/main ]; then
+              echo "::error::run the release from main, not $GITHUB_REF"
+              exit 1
+            fi
+            if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+              echo "::error::tag $VERSION already exists"
+              exit 1
+            fi
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_SHA is not on main"
+            exit 1
+          fi
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "::error::release $VERSION already exists"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: binaries
+          merge-multiple: true
+      - name: Release
+        run: |
+          cat > notes.md <<'NOTES'
+          Standalone binaries for macOS (arm64), Linux (x86_64) and Windows (x86_64): unpack the archive and run `buzz-parse page.html` or `curl -s URL | buzz-parse -s 'a[href]' --as html`, no jolt install needed. The macOS binary is unsigned, so clear the quarantine flag first: `xattr -d com.apple.quarantine buzz-parse`.
+          NOTES
+          gh release create "$VERSION" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --notes-file notes.md \
+            --generate-notes \
+            binaries/*

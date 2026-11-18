@@ -1,0 +1,19 @@
+.clj-kondo/
+.lsp/
+.cpcache/
+.dirge/
+.nrepl-port
+.DS_Store
+
+# native build output; `jolt run native` regenerates it
+native/build/
+native/libbuzz_parse.dylib
+native/libbuzz_parse.so
+native/libbuzz_parse.a
+
+# lexbor checkout fetched by the native task when LEXBOR_HOME is unset
+vendor/
+
+# jolt build cache
+.jolt/
+target/
