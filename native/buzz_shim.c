@@ -4,6 +4,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* windows.h pulls in COM's `#define interface struct`, which breaks lexbor's
+ * parameters named interface. Include it first, lean, and drop the macro;
+ * the include guard makes lexbor's own #include <windows.h> a no-op. */
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#undef interface
+#endif
+
 #include "lexbor_single.h"
 #include "buzz_shim.h"
 
